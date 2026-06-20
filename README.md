@@ -1,5 +1,5 @@
 
-![Logo](https://i.ibb.co/Gm318pH/logo.png)
+![Logo](https://i.ibb.co/zHstBwRR/Unbenannt.png)
 
 
 ## Screenshots
