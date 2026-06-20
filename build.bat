@@ -12,15 +12,15 @@ if not exist "%CD%\concrete.png" (
 )
 
 echo Compiling...
-"%GCC%" main.c settings.c bsp.c download.c -o game.exe -O2 -Wall ^
+"%GCC%" main.c settings.c bsp.c download.c -o CS-SURF.exe -O2 -Wall ^
     -I"%RLINC%" -L"%RLLIB%" ^
     -lraylib -lopengl32 -lgdi32 -lwinmm -lole32 -lurlmon
 
 if %errorlevel%==0 (
     echo.
-    echo BUILD OK - starting game.exe
+    echo BUILD OK - starting CS-SURF.exe
     echo.
-    game.exe
+    CS-SURF.exe
 ) else (
     echo.
     echo BUILD FAILED
