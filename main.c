@@ -4,22 +4,41 @@
 #include "settings.h"
 #include "bsp.h"
 #include "download.h"
+#include "console.h"
+#include "net.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
-#define SV_GRAVITY        800.0f
-#define SV_MAXSPEED       320.0f
-#define SV_ACCELERATE      10.0f
-#define SV_AIRACCELERATE  150.0f
-#define SV_FRICTION         5.0f
-#define SV_STOPSPEED      100.0f
-#define AIR_CAP            30.0f
-#define JUMP_SPEED        290.0f
+#define GITHUB_USER "Erennkrb"
 
-#define PLAYER_RADIUS      24.0f
-#define EYE_OFFSET         26.0f
+/* CS 1.6 (GoldSrc) movement cvars - live-tunable from the F1 console */
+static float  g_gravity    = 800.0f;   /* sv_gravity                 */
+static float  g_maxspeed   = 320.0f;   /* sv_maxspeed                */
+static float  g_accelerate =   5.0f;   /* sv_accelerate              */
+static float  g_airaccel   =  10.0f;   /* sv_airaccelerate           */
+static float  g_friction   =   4.0f;   /* sv_friction                */
+static float  g_stopspeed  =  75.0f;   /* sv_stopspeed               */
+static float  g_aircap     =  30.0f;   /* GoldSrc air-strafe cap     */
+static float  g_jumpspeed  = 268.3f;   /* sqrt(2*800*45)             */
+static float  g_maxvel     = 2000.0f;  /* sv_maxvelocity             */
+
+static float  gSpeedMul    = 1.0f;     /* "speed" multiplier         */
+static float  gTimescale   = 1.0f;     /* "timescale"                */
+static int    gNoclip      = 0;        /* fly / noclip               */
+static int    gAutoBhop    = 1;        /* hold-space autobhop        */
+static int    gQuitReq     = 0;
+static double gRunTime     = 0.0;      /* simulated run time         */
+static float  gPhysAccum   = 0.0f;
+#define PHYS_DT (1.0f / 100.0f)        /* 100 Hz fixed physics tick  */
+
+#define PLAYER_RADIUS      16.0f
+#define HULL_STAND         72.0f
+#define HULL_DUCK          36.0f
+#define EYE_STAND          64.0f
+#define EYE_DUCK           28.0f
 #define GROUND_NY           0.70f
 
 #define MAXS    400
@@ -33,7 +52,7 @@
 
 typedef struct { Vector3 c, right, up, tan; } Frame;
 typedef struct { Vector3 a, b, c, n, mid; } Tri;
-typedef enum { ST_MENU, ST_MAPSELECT, ST_ONLINE, ST_OPTIONS, ST_GAME, ST_PAUSE } GameState;
+typedef enum { ST_MENU, ST_MAPSELECT, ST_ONLINE, ST_OPTIONS, ST_GAME, ST_PAUSE, ST_SPECTATE } GameState;
 
 #define MAX_ONLINE 2500
 
@@ -60,7 +79,8 @@ static Vector3 camPosGlobal = { 0 };
 static Vector3 pPos, pVel;
 static float   pYaw, pPitch;
 static int     pGround;
-static double  runStart;
+static int     pDuck = 0;
+static float   gDuckLerp = 0.0f;
 static int     finished;
 static double  finishTime;
 static float   topSpeed;
@@ -72,9 +92,50 @@ static Color FOG_COLOR  = { 165, 185, 210, 255 };
 #define FOG_END   20000.0f
 
 static int   gAudio = 0;
-static Sound sndClick, sndJump, sndFinish, sndWind;
+static Sound sndClick, sndJump, sndFinish, sndWalk, sndHover;
+static int   gWalkOK = 0;
 static Texture2D gConcrete, gPfp;
 static int gTexReady = 0, gPfpReady = 0;
+
+/* ---- UI theme (charcoal + amber, sharp/flat) ------------------------- */
+static Color UI_PANEL   = {  26,  29,  36, 255 };
+static Color UI_PANEL2  = {  40,  46,  58, 255 };
+static Color UI_ACCENT  = { 240, 158,  64, 255 };
+static Color UI_TEXT    = { 228, 231, 238, 255 };
+static Color UI_DIM     = { 138, 146, 160, 255 };
+static Color UI_LINE    = {  52,  58,  70, 255 };
+
+typedef struct { int id; float anim; int wasHover; } UiAnim;
+#define UI_MAXANIM 96
+static UiAnim gUiA[UI_MAXANIM];
+static int    gUiAN = 0;
+
+/* ---- terminal console (input comes from the cmd window via console.c) - */
+#define CON_LINELEN 256
+
+static Settings *gCfg = NULL;
+
+static Model gPlayerModel;
+static ModelAnimation *gPlayerAnims = NULL;
+static int gPlayerAnimCount = 0;
+static int gPlayerOK = 0;
+static float gPlayerScale = 1.0f;
+static float gAnimTime = 0.0f;
+static int gAnimWalk = 0;
+static int gAnimIdle = 0;
+static int gAnimCrouch = 0;
+static int gAnimCrouchIdle = 0;
+static int gAnimJumpStart = 0;
+static int gAnimJumpLoop = 0;
+static int gAnimJumpEnd = 0;
+static Texture2D gPlayerTex;
+static int gPlayerTexOK = 0;
+static int gPlayerIsObj = 0;
+static int gDbgAnim = -1;
+static int gActiveAnim = 0;
+static float gMYaw  = 90.0f;
+static float gMPush = -22.0f;
+static float gMVert = 11.0f;
 
 static Model   gWorldModel;
 static int     gUseBsp = 0;
@@ -138,22 +199,61 @@ static Sound MakeBeep(float f0, float f1, float dur, float vol)
     UnloadWave(w);
     return s;
 }
-static Sound MakeWind(float dur, float vol)
+
+/* Softer UI blip: exp-decay envelope + a light 2nd harmonic. */
+static Sound MakeUi(float f0, float f1, float dur, float vol, float decay)
 {
-    int sr = 44100, n = (int)(sr * dur);
+    int sr = 44100, n = (int)(sr * dur); if (n < 1) n = 1;
     short *d = (short *)malloc(sizeof(short) * n);
-    float last = 0.0f;
     for (int i = 0; i < n; i++) {
-        float white = (float)GetRandomValue(-1000, 1000) / 1000.0f;
-        last = last * 0.96f + white * 0.04f;
-        d[i] = (short)(last * vol * 32767.0f);
+        float t = (float)i / sr, p = (float)i / n;
+        float f = f0 + (f1 - f0) * p;
+        float env = expf(-p * decay) * (1.0f - p);
+        float w = sinf(2.0f * PI * f * t) * 0.72f + sinf(2.0f * PI * f * 2.0f * t) * 0.18f;
+        d[i] = (short)(w * env * vol * 32767.0f);
     }
-    Wave w; w.frameCount = n; w.sampleRate = sr; w.sampleSize = 16; w.channels = 1; w.data = d;
-    Sound s = LoadSoundFromWave(w);
-    UnloadWave(w);
+    Wave wv; wv.frameCount = n; wv.sampleRate = sr; wv.sampleSize = 16; wv.channels = 1; wv.data = d;
+    Sound s = LoadSoundFromWave(wv);
+    UnloadWave(wv);
     return s;
 }
 static void PlayClick(void) { if (gAudio) PlaySound(sndClick); }
+static void PlayHover(void) { if (gAudio) PlaySound(sndHover); }
+
+/* Default-font text with letter spacing (reads more deliberate than DrawText). */
+static void TextSp(const char *t, int x, int y, int size, float sp, Color c)
+{
+    DrawTextEx(GetFontDefault(), t, (Vector2){ (float)x, (float)y }, (float)size, sp, c);
+}
+static int TextSpW(const char *t, int size, float sp)
+{
+    return (int)MeasureTextEx(GetFontDefault(), t, (float)size, sp).x;
+}
+static void UpperStr(const char *s, char *out, int cap)
+{
+    int i = 0;
+    for (; s[i] && i < cap - 1; i++) { char c = s[i]; if (c >= 'a' && c <= 'z') c -= 32; out[i] = c; }
+    out[i] = 0;
+}
+static Color Lerp3(Color a, Color b, float t)
+{
+    return (Color){ (unsigned char)(a.r + (b.r - a.r) * t),
+                    (unsigned char)(a.g + (b.g - a.g) * t),
+                    (unsigned char)(a.b + (b.b - a.b) * t), 255 };
+}
+static UiAnim *UiSlot(int id)
+{
+    for (int i = 0; i < gUiAN; i++) if (gUiA[i].id == id) return &gUiA[i];
+    if (gUiAN < UI_MAXANIM) { gUiA[gUiAN].id = id; gUiA[gUiAN].anim = 0; gUiA[gUiAN].wasHover = 0; return &gUiA[gUiAN++]; }
+    return &gUiA[0];
+}
+static void DrawHeader(const char *t, int y, int SW)
+{
+    char u[80]; UpperStr(t, u, sizeof u);
+    int s = 50, w = TextSpW(u, s, 6), x = SW / 2 - w / 2;
+    TextSp(u, x, y, s, 6, UI_TEXT);
+    DrawRectangle(x, y + s + 6, w, 3, UI_ACCENT);
+}
 
 static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
 {
@@ -248,8 +348,8 @@ static void Friction(Vector3 *vel, float dt)
 {
     float speed = sqrtf(vel->x * vel->x + vel->z * vel->z);
     if (speed < 1.0f) { vel->x = 0; vel->z = 0; return; }
-    float control = (speed < SV_STOPSPEED) ? SV_STOPSPEED : speed;
-    float newspeed = speed - control * SV_FRICTION * dt;
+    float control = (speed < g_stopspeed) ? g_stopspeed : speed;
+    float newspeed = speed - control * g_friction * dt;
     if (newspeed < 0.0f) newspeed = 0.0f;
     float scale = newspeed / speed;
     vel->x *= scale; vel->z *= scale;
@@ -265,11 +365,11 @@ static void Accelerate(Vector3 *vel, Vector3 wishdir, float wishspeed, float acc
 }
 static void AirAccelerate(Vector3 *vel, Vector3 wishdir, float wishspeed, float dt)
 {
-    float wishspd = wishspeed; if (wishspd > AIR_CAP) wishspd = AIR_CAP;
+    float wishspd = wishspeed; if (wishspd > g_aircap) wishspd = g_aircap;
     float current = Vector3DotProduct(*vel, wishdir);
     float add = wishspd - current;
     if (add <= 0.0f) return;
-    float a = SV_AIRACCELERATE * wishspeed * dt;
+    float a = g_airaccel * wishspeed * dt;
     if (a > add) a = add;
     *vel = Vector3Add(*vel, Vector3Scale(wishdir, a));
 }
@@ -326,9 +426,12 @@ static void BuildWorldCollision(BspData *b)
         wTris[i].mid = Vector3Scale(Vector3Add(Vector3Add(a, c0), c1), 1.0f/3.0f);
         Vector3 vs[3] = { a, c0, c1 };
         for (int k = 0; k < 3; k++) {
-            if (vs[k].x < minX) minX = vs[k].x; if (vs[k].x > maxX) maxX = vs[k].x;
-            if (vs[k].y < minY) minY = vs[k].y; if (vs[k].y > maxY) maxY = vs[k].y;
-            if (vs[k].z < minZ) minZ = vs[k].z; if (vs[k].z > maxZ) maxZ = vs[k].z;
+            if (vs[k].x < minX) minX = vs[k].x;
+            if (vs[k].x > maxX) maxX = vs[k].x;
+            if (vs[k].y < minY) minY = vs[k].y;
+            if (vs[k].y > maxY) maxY = vs[k].y;
+            if (vs[k].z < minZ) minZ = vs[k].z;
+            if (vs[k].z > maxZ) maxZ = vs[k].z;
         }
     }
     gMinX = minX; gMinZ = minZ;
@@ -336,7 +439,8 @@ static void BuildWorldCollision(BspData *b)
     gCell = 256.0f;
     while (((spanX / gCell + 1.0f) * (spanZ / gCell + 1.0f)) > 1000000.0f) gCell *= 2.0f;
     gNX = (int)(spanX / gCell) + 1; gNZ = (int)(spanZ / gCell) + 1;
-    if (gNX < 1) gNX = 1; if (gNZ < 1) gNZ = 1;
+    if (gNX < 1) gNX = 1;
+    if (gNZ < 1) gNZ = 1;
     int cells = gNX * gNZ;
     gCellStart = (int *)calloc(cells + 1, sizeof(int));
     for (int i = 0; i < wTriCount; i++) {
@@ -346,7 +450,10 @@ static void BuildWorldCollision(BspData *b)
         float mxz = fmaxf(fmaxf(wTris[i].a.z, wTris[i].b.z), wTris[i].c.z);
         int x0 = (int)((mnx - gMinX) / gCell), x1 = (int)((mxx - gMinX) / gCell);
         int z0 = (int)((mnz - gMinZ) / gCell), z1 = (int)((mxz - gMinZ) / gCell);
-        if (x0 < 0) x0 = 0; if (z0 < 0) z0 = 0; if (x1 >= gNX) x1 = gNX - 1; if (z1 >= gNZ) z1 = gNZ - 1;
+        if (x0 < 0) x0 = 0;
+        if (z0 < 0) z0 = 0;
+        if (x1 >= gNX) x1 = gNX - 1;
+        if (z1 >= gNZ) z1 = gNZ - 1;
         for (int z = z0; z <= z1; z++) for (int x = x0; x <= x1; x++) gCellStart[z*gNX + x + 1]++;
     }
     for (int i = 0; i < cells; i++) gCellStart[i+1] += gCellStart[i];
@@ -361,7 +468,10 @@ static void BuildWorldCollision(BspData *b)
         float mxz = fmaxf(fmaxf(wTris[i].a.z, wTris[i].b.z), wTris[i].c.z);
         int x0 = (int)((mnx - gMinX) / gCell), x1 = (int)((mxx - gMinX) / gCell);
         int z0 = (int)((mnz - gMinZ) / gCell), z1 = (int)((mxz - gMinZ) / gCell);
-        if (x0 < 0) x0 = 0; if (z0 < 0) z0 = 0; if (x1 >= gNX) x1 = gNX - 1; if (z1 >= gNZ) z1 = gNZ - 1;
+        if (x0 < 0) x0 = 0;
+        if (z0 < 0) z0 = 0;
+        if (x1 >= gNX) x1 = gNX - 1;
+        if (z1 >= gNZ) z1 = gNZ - 1;
         for (int z = z0; z <= z1; z++) for (int x = x0; x <= x1; x++) gCellItems[cur[z*gNX + x]++] = i;
     }
     free(cur);
@@ -372,22 +482,60 @@ static void BuildWorldCollision(BspData *b)
     gOrbitR = fmaxf(spanX, spanZ) * 0.6f + 1200.0f;
 }
 
-static void ResolveWorld(Vector3 *pos, Vector3 *vel, int *onground)
+static void ResolveSphereAt(Vector3 *pos, Vector3 *vel, int *onground)
 {
-    wStampCur++;
-    int cx = (int)((pos->x - gMinX) / gCell);
-    int cz = (int)((pos->z - gMinZ) / gCell);
-    for (int dz = -1; dz <= 1; dz++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            int X = cx + dx, Z = cz + dz;
-            if (X < 0 || Z < 0 || X >= gNX || Z >= gNZ) continue;
-            int cell = Z * gNX + X;
-            for (int k = gCellStart[cell]; k < gCellStart[cell+1]; k++) {
-                int ti = gCellItems[k];
-                if (wStamp[ti] == wStampCur) continue;
-                wStamp[ti] = wStampCur;
-                ResolveTri(&wTris[ti], pos, vel, onground);
+    if (gUseBsp) {
+        wStampCur++;
+        int cx = (int)((pos->x - gMinX) / gCell);
+        int cz = (int)((pos->z - gMinZ) / gCell);
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int X = cx + dx, Z = cz + dz;
+                if (X < 0 || Z < 0 || X >= gNX || Z >= gNZ) continue;
+                int cell = Z * gNX + X;
+                for (int k = gCellStart[cell]; k < gCellStart[cell+1]; k++) {
+                    int ti = gCellItems[k];
+                    if (wStamp[ti] == wStampCur) continue;
+                    wStamp[ti] = wStampCur;
+                    ResolveTri(&wTris[ti], pos, vel, onground);
+                }
             }
+        }
+    } else {
+        for (int i = 0; i < triCount; i++) ResolveTri(&tris[i], pos, vel, onground);
+    }
+}
+
+static void MoveAndCollide(float dt)
+{
+    pVel.y -= g_gravity * dt;
+    if (pVel.x >  g_maxvel) pVel.x =  g_maxvel;
+    if (pVel.x < -g_maxvel) pVel.x = -g_maxvel;
+    if (pVel.y >  g_maxvel) pVel.y =  g_maxvel;
+    if (pVel.y < -g_maxvel) pVel.y = -g_maxvel;
+    if (pVel.z >  g_maxvel) pVel.z =  g_maxvel;
+    if (pVel.z < -g_maxvel) pVel.z = -g_maxvel;
+
+    pGround = 0;
+    float moveLen = Vector3Length(pVel) * dt;
+    int steps = (int)(moveLen / (PLAYER_RADIUS * 0.5f)) + 1;
+    if (steps > 16) steps = 16;
+    float sdt = dt / (float)steps;
+
+    float H = HULL_STAND + (HULL_DUCK - HULL_STAND) * gDuckLerp;
+    float botC = PLAYER_RADIUS;
+    float topC = H - PLAYER_RADIUS;
+    if (topC < botC) topC = botC;
+    float offs[5];
+    for (int k = 0; k < 5; k++) offs[k] = botC + (topC - botC) * (k / 4.0f);
+
+    for (int st = 0; st < steps; st++) {
+        pPos = Vector3Add(pPos, Vector3Scale(pVel, sdt));
+        for (int k = 0; k < 5; k++) {
+            Vector3 before = { pPos.x, pPos.y + offs[k], pPos.z };
+            Vector3 sc = before;
+            ResolveSphereAt(&sc, &pVel, &pGround);
+            pPos = Vector3Add(pPos, Vector3Subtract(sc, before));
         }
     }
 }
@@ -472,6 +620,17 @@ static void ScanMaps(void)
     if (gScroll < 0) gScroll = 0;
 }
 
+static int FindLocalMap(const char *name)
+{
+    for (int i = 0; i < (int)gMaps.count; i++) {
+        char b[64];
+        strncpy(b, GetFileNameWithoutExt(gMaps.paths[i]), 63);
+        b[63] = 0;
+        if (strcmp(b, name) == 0) return i;
+    }
+    return -1;
+}
+
 static int LoadBspMap(int i)
 {
     if (i < 0 || i >= (int)gMaps.count) return 0;
@@ -495,10 +654,11 @@ static int LoadBspMap(int i)
     selectedMap = i;
     cpCount = 0;
     if (bsp.hasSpawn)
-        spawnPos = (Vector3){ bsp.spawn[0], bsp.spawn[1] + 50.0f, bsp.spawn[2] };
+        spawnPos = (Vector3){ bsp.spawn[0], bsp.spawn[1] + 4.0f, bsp.spawn[2] };
     else
         spawnPos = (Vector3){ gWorldCenter.x, gWorldCenter.y + 300.0f, gWorldCenter.z };
     spawnYaw = 0.0f;
+    Net_SetMap(GetFileNameWithoutExt(gMaps.paths[i]));   /* advertise to spectators */
     return 1;
 }
 
@@ -708,21 +868,29 @@ static void ResetRun(void)
 {
     pPos = spawnPos; pVel = (Vector3){ 0, 0, 0 }; pGround = 0;
     pYaw = spawnYaw; pPitch = -0.2f;
-    finished = 0; runStart = GetTime(); topSpeed = 0.0f;
+    finished = 0; gRunTime = 0.0; topSpeed = 0.0f;
     cpPassed = 0;
 }
 static int UiButton(Rectangle r, const char *text, int fontSize, int enabled)
 {
+    int id = (int)(r.x * 7.0f) + (int)(r.y * 131.0f) + (int)r.width * 3 + (text ? text[0] : 0);
+    UiAnim *a = UiSlot(id);
     Vector2 m = GetMousePosition();
     int hover = enabled && CheckCollisionPointRec(m, r);
-    Color bg = !enabled ? (Color){ 40, 44, 54, 255 }
-             : hover    ? (Color){ 80, 105, 160, 255 }
-                        : (Color){ 48, 58, 84, 255 };
-    DrawRectangleRounded(r, 0.22f, 8, bg);
-    DrawRectangleLinesEx(r, hover ? 2.0f : 1.0f, (Color){ 150, 175, 220, 180 });
-    int tw = MeasureText(text, fontSize);
-    DrawText(text, (int)(r.x + r.width / 2 - tw / 2), (int)(r.y + r.height / 2 - fontSize / 2), fontSize,
-             enabled ? RAYWHITE : (Color){ 120, 120, 130, 255 });
+    if (hover && !a->wasHover) PlayHover();
+    a->wasHover = hover;
+    float k = (a->anim += ((hover ? 1.0f : 0.0f) - a->anim) * fminf(1.0f, GetFrameTime() * 14.0f));
+
+    Color base = enabled ? UI_PANEL : (Color){ 30, 32, 38, 255 };
+    DrawRectangleRec(r, Lerp3(base, UI_PANEL2, k));
+    DrawRectangle((int)r.x, (int)r.y, (int)(3 + 5 * k), (int)r.height, enabled ? UI_ACCENT : UI_LINE);
+    DrawRectangleLinesEx(r, 1.0f, (Color){ UI_LINE.r, UI_LINE.g, UI_LINE.b, 200 });
+
+    char up[128]; UpperStr(text, up, sizeof up);
+    int tw = TextSpW(up, fontSize, 2.0f);
+    TextSp(up, (int)(r.x + r.width / 2 - tw / 2 + 3 * k), (int)(r.y + r.height / 2 - fontSize / 2),
+           fontSize, 2.0f, enabled ? UI_TEXT : UI_DIM);
+
     int clicked = hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     if (clicked) PlayClick();
     return clicked;
@@ -759,11 +927,173 @@ static void ToggleFS(Settings *s)
     }
 }
 
+/* ===================  FIXED-TIMESTEP PHYSICS (CS 1.6)  ================= */
+static void PhysicsStep(float dt, Vector3 fwd, Vector3 right, Vector3 look)
+{
+    float f = (IsKeyDown(KEY_W) ? 1.0f : 0.0f) - (IsKeyDown(KEY_S) ? 1.0f : 0.0f);
+    float s = (IsKeyDown(KEY_D) ? 1.0f : 0.0f) - (IsKeyDown(KEY_A) ? 1.0f : 0.0f);
+
+    if (gNoclip) {
+        float up = (IsKeyDown(KEY_SPACE) ? 1.0f : 0.0f)
+                 - ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_C)) ? 1.0f : 0.0f);
+        Vector3 wish = Vector3Add(Vector3Add(Vector3Scale(look, f), Vector3Scale(right, s)),
+                                  Vector3Scale((Vector3){ 0, 1, 0 }, up));
+        float l = Vector3Length(wish);
+        Vector3 dir = (l > 0.0001f) ? Vector3Scale(wish, 1.0f / l) : (Vector3){ 0, 0, 0 };
+        pVel = Vector3Scale(dir, g_maxspeed * 3.0f * gSpeedMul);
+        pPos = Vector3Add(pPos, Vector3Scale(pVel, dt));
+        pGround = 0;
+        return;
+    }
+
+    float maxspd = g_maxspeed * (1.0f - 0.62f * gDuckLerp) * gSpeedMul;
+    Vector3 wishvel = Vector3Add(Vector3Scale(fwd, f), Vector3Scale(right, s));
+    float wishlen = Vector3Length(wishvel);
+    Vector3 wishdir = (wishlen > 0.0001f) ? Vector3Scale(wishvel, 1.0f / wishlen) : (Vector3){ 0, 0, 0 };
+    float wishspeed = (wishlen > 0.0001f) ? maxspd : 0.0f;
+
+    int jumpNow = pGround && (gAutoBhop ? IsKeyDown(KEY_SPACE) : IsKeyPressed(KEY_SPACE));
+
+    if (pGround) {
+        if (!jumpNow) Friction(&pVel, dt);   /* skip friction on the jump tick -> keeps bhop/surf exit speed */
+        Accelerate(&pVel, wishdir, wishspeed, g_accelerate, dt);
+        if (jumpNow) { pVel.y = g_jumpspeed; pGround = 0; if (gAudio) PlaySound(sndJump); }
+    } else {
+        AirAccelerate(&pVel, wishdir, wishspeed, dt);
+    }
+
+    int wasFinished = finished;
+    MoveAndCollide(dt);
+
+    if (cpPassed < cpCount) {
+        Vector3 cpc = frames[cpIdx[cpPassed]].c;
+        if (Vector3Distance(pPos, cpc) < WX * 1.4f) {
+            cpSplit[cpPassed] = gRunTime;
+            cpPassed++;
+            if (cpPassed >= cpCount && !finished) { finished = 1; finishTime = gRunTime; }
+        }
+    }
+    if (finished && !wasFinished && gAudio) PlaySound(sndFinish);
+    if (!finished) gRunTime += dt;
+
+    float hspeed = sqrtf(pVel.x * pVel.x + pVel.z * pVel.z);
+    if (!finished && hspeed > topSpeed) topSpeed = hspeed;
+
+    if (pPos.y < gKillY) ResetRun();
+}
+
+/* =====================  TERMINAL CONSOLE COMMANDS  ==================== */
+static int ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+    }
+    return *a == *b;
+}
+static void ConPrint(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+    putchar('\n');
+    fflush(stdout);
+}
+
+typedef struct { const char *name, *usage, *help; } ConCmd;
+static const ConCmd gCmds[] = {
+    { "help",       "help [cmd]",        "List commands, or show help for one." },
+    { "fly",        "fly [0|1]",         "Noclip / fly mode (no gravity or collision)." },
+    { "noclip",     "noclip [0|1]",      "Same as fly." },
+    { "speed",      "speed <mult>",      "Movement-speed multiplier (1 = normal)." },
+    { "maxspeed",   "maxspeed <u>",      "sv_maxspeed (CS 1.6 = 320)." },
+    { "gravity",    "gravity <v>",       "sv_gravity (default 800)." },
+    { "airaccel",   "airaccel <v>",      "sv_airaccelerate (default 10)." },
+    { "accelerate", "accelerate <v>",    "sv_accelerate (default 5)." },
+    { "friction",   "friction <v>",      "sv_friction (default 4)." },
+    { "aircap",     "aircap <v>",        "Air-strafe speed cap (GoldSrc = 30)." },
+    { "jump",       "jump <v>",          "Jump velocity (default 268.3)." },
+    { "autobhop",   "autobhop [0|1]",    "Hold-space auto bunnyhop." },
+    { "timescale",  "timescale <v>",     "Game speed (1 = normal, 0.5 = slow-mo)." },
+    { "fov",        "fov <deg>",         "Field of view (60-120)." },
+    { "sens",       "sens <v>",          "Mouse sensitivity." },
+    { "fps",        "fps [cap]",         "Show or set FPS cap (0 = unlimited)." },
+    { "vsync",      "vsync [0|1]",       "Toggle vertical sync." },
+    { "pos",        "pos",               "Print player position and speed." },
+    { "tp",         "tp <x> <y> <z>",    "Teleport to coordinates." },
+    { "respawn",    "respawn",           "Restart the run (same as R)." },
+    { "reset",      "reset",             "Reset all physics cvars to CS 1.6 defaults." },
+    { "echo",       "echo <text>",       "Print text to the console." },
+    { "clear",      "clear",             "Clear the console." },
+    { "quit",       "quit",              "Exit the game." },
+};
+#define NCMD ((int)(sizeof gCmds / sizeof gCmds[0]))
+
+static void ResetCvars(void)
+{
+    g_gravity = 800.0f; g_maxspeed = 320.0f; g_accelerate = 5.0f; g_airaccel = 10.0f;
+    g_friction = 4.0f; g_stopspeed = 75.0f; g_aircap = 30.0f; g_jumpspeed = 268.3f;
+    gSpeedMul = 1.0f; gTimescale = 1.0f; gAutoBhop = 1; gNoclip = 0;
+}
+static void ExecCommand(const char *line)
+{
+    char buf[CON_LINELEN]; strncpy(buf, line, CON_LINELEN - 1); buf[CON_LINELEN - 1] = 0;
+    char *argv[12]; int argc = 0;
+    for (char *p = strtok(buf, " \t"); p && argc < 12; p = strtok(NULL, " \t")) argv[argc++] = p;
+    if (argc == 0) return;
+    const char *c = argv[0];
+    int   hasArg = argc > 1;
+    float fv = hasArg ? (float)atof(argv[1]) : 0.0f;
+    int   iv = hasArg ? atoi(argv[1]) : 0;
+
+    if (ieq(c, "help")) {
+        if (hasArg) {
+            for (int i = 0; i < NCMD; i++)
+                if (ieq(argv[1], gCmds[i].name)) { ConPrint("%s  -  %s", gCmds[i].usage, gCmds[i].help); return; }
+            ConPrint("no such command: %s", argv[1]);
+        } else {
+            ConPrint("commands (type 'help <cmd>' for detail):");
+            char row[CON_LINELEN]; row[0] = 0;
+            for (int i = 0; i < NCMD; i++) {
+                strncat(row, gCmds[i].name, sizeof row - strlen(row) - 2);
+                strncat(row, "  ", sizeof row - strlen(row) - 2);
+                if ((i % 5) == 4) { ConPrint("  %s", row); row[0] = 0; }
+            }
+            if (row[0]) ConPrint("  %s", row);
+        }
+    }
+    else if (ieq(c, "fly") || ieq(c, "noclip")) { gNoclip = hasArg ? (iv != 0) : !gNoclip; if (gNoclip) pVel = (Vector3){ 0, 0, 0 }; ConPrint("fly %s", gNoclip ? "ON" : "off"); }
+    else if (ieq(c, "speed"))      { if (hasArg) gSpeedMul  = fmaxf(0.05f, fv); ConPrint("speed %.2f", gSpeedMul); }
+    else if (ieq(c, "maxspeed"))   { if (hasArg) g_maxspeed = fv; ConPrint("sv_maxspeed %.0f", g_maxspeed); }
+    else if (ieq(c, "gravity"))    { if (hasArg) g_gravity  = fv; ConPrint("sv_gravity %.0f", g_gravity); }
+    else if (ieq(c, "airaccel"))   { if (hasArg) g_airaccel = fv; ConPrint("sv_airaccelerate %.1f", g_airaccel); }
+    else if (ieq(c, "accelerate")) { if (hasArg) g_accelerate = fv; ConPrint("sv_accelerate %.1f", g_accelerate); }
+    else if (ieq(c, "friction"))   { if (hasArg) g_friction = fv; ConPrint("sv_friction %.1f", g_friction); }
+    else if (ieq(c, "aircap"))     { if (hasArg) g_aircap   = fv; ConPrint("aircap %.0f", g_aircap); }
+    else if (ieq(c, "jump"))       { if (hasArg) g_jumpspeed = fv; ConPrint("jump %.1f", g_jumpspeed); }
+    else if (ieq(c, "autobhop"))   { gAutoBhop = hasArg ? (iv != 0) : !gAutoBhop; ConPrint("autobhop %s", gAutoBhop ? "ON" : "off"); }
+    else if (ieq(c, "timescale"))  { if (hasArg) gTimescale = fmaxf(0.05f, fminf(10.0f, fv)); ConPrint("timescale %.2f", gTimescale); }
+    else if (ieq(c, "fov"))        { if (gCfg && hasArg) { gCfg->fov = iv < 60 ? 60 : iv > 120 ? 120 : iv; } ConPrint("fov %d", gCfg ? gCfg->fov : 0); }
+    else if (ieq(c, "sens"))       { if (gCfg && hasArg) { int v = (int)(fv * 10.0f); gCfg->mouseSens = v < 3 ? 3 : v > 200 ? 200 : v; } ConPrint("sensitivity %.2f", gCfg ? gCfg->mouseSens * 0.1f : 0.0f); }
+    else if (ieq(c, "fps"))        { if (gCfg && hasArg) { gCfg->fpsCap = iv < 0 ? 0 : iv; Settings_Apply(gCfg); } ConPrint("fps cap %d", gCfg ? gCfg->fpsCap : 0); }
+    else if (ieq(c, "vsync"))      { if (gCfg) { gCfg->vsync = hasArg ? (iv != 0) : !gCfg->vsync; ApplyVsync(gCfg->vsync); ConPrint("vsync %s", gCfg->vsync ? "ON" : "off"); } }
+    else if (ieq(c, "pos"))        { ConPrint("pos  %.0f %.0f %.0f   speed %.0f u/s", pPos.x, pPos.y, pPos.z, sqrtf(pVel.x * pVel.x + pVel.z * pVel.z)); }
+    else if (ieq(c, "tp"))         { if (argc >= 4) { pPos = (Vector3){ (float)atof(argv[1]), (float)atof(argv[2]), (float)atof(argv[3]) }; pVel = (Vector3){ 0, 0, 0 }; ConPrint("teleported"); } else ConPrint("usage: tp <x> <y> <z>"); }
+    else if (ieq(c, "respawn") || ieq(c, "r")) { ResetRun(); ConPrint("run restarted"); }
+    else if (ieq(c, "reset"))      { ResetCvars(); ConPrint("cvars reset to CS 1.6 defaults"); }
+    else if (ieq(c, "echo"))       { char m[CON_LINELEN]; m[0] = 0; for (int i = 1; i < argc; i++) { strncat(m, argv[i], sizeof m - strlen(m) - 2); strncat(m, " ", sizeof m - strlen(m) - 2); } ConPrint("%s", m); }
+    else if (ieq(c, "clear"))      { system("cls"); }
+    else if (ieq(c, "quit") || ieq(c, "exit")) { gQuitReq = 1; }
+    else ConPrint("unknown command: %s  (try 'help')", c);
+}
+
 int main(void)
 {
     Settings settings;
     Settings_Load(&settings);
     settings.fullscreen = 0;
+    gCfg = &settings;
 
     int w, h; Settings_GetResolution(&settings, &w, &h);
     unsigned int flags = FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE;
@@ -792,10 +1122,15 @@ int main(void)
     if (IsAudioDeviceReady()) {
         gAudio = 1;
         SetMasterVolume(settings.masterVolume / 100.0f);
-        sndClick  = MakeBeep(880.0f, 880.0f, 0.04f, 0.30f);
-        sndJump   = MakeBeep(320.0f, 620.0f, 0.12f, 0.35f);
+        sndClick  = MakeUi(620.0f, 880.0f, 0.060f, 0.22f, 6.0f);
+        sndHover  = MakeUi(1050.0f, 1180.0f, 0.028f, 0.10f, 10.0f);
         sndFinish = MakeBeep(523.0f, 1046.0f, 0.45f, 0.40f);
-        sndWind   = MakeWind(2.0f, 0.5f);
+        if (FileExists("sounds/jump.mp3")) sndJump = LoadSound("sounds/jump.mp3");
+        else                               sndJump = MakeBeep(320.0f, 620.0f, 0.12f, 0.35f);
+        if (FileExists("sounds/walking_on_concrete.mp3")) {
+            sndWalk = LoadSound("sounds/walking_on_concrete.mp3");
+            gWalkOK = 1;
+        }
     }
 
     {
@@ -817,14 +1152,66 @@ int main(void)
         gTexReady = 1;
     }
 
-    if (FileExists("pfp.png")) {
-        Image a = LoadImage("pfp.png");
-        if (a.data != NULL) {
+    {
+        /* Pull the profile picture straight from GitHub (cached after first run). */
+        const char *cache = "pfp_cache.png";
+        if (!FileExists(cache))
+            Net_Download("https://github.com/" GITHUB_USER ".png?size=128", cache);
+        Image a = { 0 };
+        if (FileExists(cache))           a = LoadImage(cache);
+        if (a.width == 0 && FileExists("pfp.png")) a = LoadImage("pfp.png");
+        if (a.width > 0 && a.data != NULL) {
             ImageResize(&a, 64, 64);
             gPfp = LoadTextureFromImage(a);
             SetTextureFilter(gPfp, TEXTURE_FILTER_BILINEAR);
             UnloadImage(a);
             gPfpReady = 1;
+        }
+    }
+
+    if (0) {
+        const char *mf = NULL;
+        if (FileExists("player.glb")) mf = "player.glb";
+        else if (FileExists("models/player.glb")) mf = "models/player.glb";
+        else if (FileExists("models/player.gltf")) mf = "models/player.gltf";
+        else if (FileExists("models/player.iqm")) mf = "models/player.iqm";
+        else if (FileExists("models/tr-phoenix/source/asd.obj")) { mf = "models/tr-phoenix/source/asd.obj"; gPlayerIsObj = 1; }
+        if (mf) {
+            gPlayerModel = LoadModel(mf);
+            if (gPlayerModel.meshCount > 0) {
+                gPlayerOK = 1;
+                gPlayerAnims = LoadModelAnimations(mf, &gPlayerAnimCount);
+
+                int n = gPlayerAnimCount;
+                gAnimWalk       = 0;
+                gAnimCrouch     = (n > 1) ? 1 : 0;
+                gAnimCrouchIdle = (n > 2) ? 2 : gAnimCrouch;
+                gAnimJumpStart  = (n > 3) ? 3 : 0;
+                gAnimJumpEnd    = (n > 4) ? 4 : 0;
+                gAnimJumpLoop   = (n > 5) ? 5 : ((n > 3) ? 3 : 0);
+                gAnimIdle       = 0;
+
+                BoundingBox bb = GetModelBoundingBox(gPlayerModel);
+                float hgt = bb.max.y - bb.min.y;
+                if (hgt < 0.001f) hgt = 1.0f;
+                gPlayerScale = HULL_STAND / hgt;
+
+                if (gPlayerIsObj) {
+                    const char *tp = "models/tr-phoenix/textures/t_phoenix.png";
+                    if (FileExists(tp)) {
+                        gPlayerTex = LoadTexture(tp);
+                        SetTextureFilter(gPlayerTex, TEXTURE_FILTER_BILINEAR);
+                        gPlayerTexOK = 1;
+                        for (int mi = 0; mi < gPlayerModel.materialCount; mi++) {
+                            gPlayerModel.materials[mi].maps[MATERIAL_MAP_DIFFUSE].texture = gPlayerTex;
+                            gPlayerModel.materials[mi].maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+                        }
+                    }
+                }
+                TraceLog(LOG_INFO, "Player model: %d meshes, %d anims, scale %.3f (walk %d idle %d crouch %d cidle %d jLoop %d)",
+                         gPlayerModel.meshCount, gPlayerAnimCount, gPlayerScale,
+                         gAnimWalk, gAnimIdle, gAnimCrouch, gAnimCrouchIdle, gAnimJumpLoop);
+            }
         }
     }
 
@@ -834,11 +1221,25 @@ int main(void)
     for (int mi = 0; mi < (int)gMaps.count; mi++) { if (LoadBspMap(mi)) break; }
 
     ResetRun();
+    Con_Start();
+    ConPrint("====================================================");
+    ConPrint(" CS SURF terminal console");
+    ConPrint(" type commands here while the game runs - 'help' for the list");
+    ConPrint("====================================================");
+    if (Net_Init()) {
+        ConPrint("Steam: connected as %s  (invite friends via Shift+Tab)", Net_SelfName());
+        if (gUseBsp && selectedMap < (int)gMaps.count)
+            Net_SetMap(GetFileNameWithoutExt(gMaps.paths[selectedMap]));
+    } else {
+        ConPrint("Steam: not running - spectating disabled");
+    }
 
     GameState state = ST_MENU;
     float menuAngle = 0.0f;
+    int specHadView = 0;
+    Vector3 specLastPos = { 0 };
 
-    while (!WindowShouldClose())
+    while (!WindowShouldClose() && !gQuitReq)
     {
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;
@@ -848,80 +1249,92 @@ int main(void)
         if (IsKeyPressed(KEY_F11)) ToggleFS(&settings);
         float sens = settings.mouseSens * 0.0001f;
 
+        /* commands typed into the game's terminal window (console.c) */
+        char cmdline[CON_LINELEN];
+        while (Con_Poll(cmdline, sizeof cmdline)) {
+            if (cmdline[0]) { printf("> %s\n", cmdline); fflush(stdout); ExecCommand(cmdline); }
+        }
+
+        /* Steam: pump callbacks; enter spectate when a friend invite is accepted */
+        Net_Update();
+        {
+            char joinMap[64];
+            if (Net_PollSpectateStart(joinMap, sizeof joinMap)) {
+                if (joinMap[0]) { int mi = FindLocalMap(joinMap); if (mi >= 0) LoadBspMap(mi); }
+                ConPrint("Spectating %s", Net_HostName());
+                state = ST_SPECTATE;
+            }
+        }
+
         if (state == ST_GAME) { if (!IsCursorHidden()) DisableCursor(); }
         else                  { if (IsCursorHidden())  EnableCursor();  }
 
         if (state == ST_GAME)
         {
-            if (IsKeyPressed(KEY_ESCAPE)) state = ST_PAUSE;
+            {
+                if (IsKeyPressed(KEY_ESCAPE)) state = ST_PAUSE;
 
-            Vector2 md = GetMouseDelta();
-            pYaw   += md.x * sens;
-            pPitch -= md.y * sens;
-            if (pPitch >  1.55f) pPitch =  1.55f;
-            if (pPitch < -1.55f) pPitch = -1.55f;
+                Vector2 md = GetMouseDelta();
+                pYaw   += md.x * sens;
+                pPitch -= md.y * sens;
+                if (pPitch >  1.55f) pPitch =  1.55f;
+                if (pPitch < -1.55f) pPitch = -1.55f;
 
-            Vector3 look = { cosf(pPitch) * cosf(pYaw), sinf(pPitch), cosf(pPitch) * sinf(pYaw) };
-            Vector3 fwd  = Vector3Normalize((Vector3){ look.x, 0, look.z });
-            Vector3 right = Vector3Normalize(Vector3CrossProduct(fwd, (Vector3){ 0, 1, 0 }));
+                Vector3 look = { cosf(pPitch) * cosf(pYaw), sinf(pPitch), cosf(pPitch) * sinf(pYaw) };
+                Vector3 fwd  = Vector3Normalize((Vector3){ look.x, 0, look.z });
+                Vector3 right = Vector3Normalize(Vector3CrossProduct(fwd, (Vector3){ 0, 1, 0 }));
 
-            float f = (IsKeyDown(KEY_W) ? 1.0f : 0.0f) - (IsKeyDown(KEY_S) ? 1.0f : 0.0f);
-            float s = (IsKeyDown(KEY_D) ? 1.0f : 0.0f) - (IsKeyDown(KEY_A) ? 1.0f : 0.0f);
-            Vector3 wishvel = Vector3Add(Vector3Scale(fwd, f), Vector3Scale(right, s));
-            float wishlen = Vector3Length(wishvel);
-            Vector3 wishdir = (wishlen > 0.0001f) ? Vector3Scale(wishvel, 1.0f / wishlen) : (Vector3){ 0, 0, 0 };
-            float wishspeed = (wishlen > 0.0001f) ? SV_MAXSPEED : 0.0f;
-
-            if (pGround) {
-                Friction(&pVel, dt);
-                Accelerate(&pVel, wishdir, wishspeed, SV_ACCELERATE, dt);
-                if (IsKeyDown(KEY_SPACE)) { pVel.y = JUMP_SPEED; pGround = 0; if (gAudio) PlaySound(sndJump); }
-            } else {
-                AirAccelerate(&pVel, wishdir, wishspeed, dt);
-            }
-            pVel.y -= SV_GRAVITY * dt;
-
-            int wasFinished = finished;
-            pGround = 0;
-            float moveLen = Vector3Length(pVel) * dt;
-            int steps = (int)(moveLen / (PLAYER_RADIUS * 0.5f)) + 1;
-            if (steps > 16) steps = 16;
-            float sdt = dt / (float)steps;
-            for (int st = 0; st < steps; st++) {
-                pPos = Vector3Add(pPos, Vector3Scale(pVel, sdt));
-                if (gUseBsp) ResolveWorld(&pPos, &pVel, &pGround);
-                else for (int i = 0; i < triCount; i++) ResolveTri(&tris[i], &pPos, &pVel, &pGround);
-            }
-
-            if (cpPassed < cpCount) {
-                Vector3 cpc = frames[cpIdx[cpPassed]].c;
-                if (Vector3Distance(pPos, cpc) < WX * 1.4f) {
-                    cpSplit[cpPassed] = GetTime() - runStart;
-                    cpPassed++;
-                    if (cpPassed >= cpCount && !finished) { finished = 1; finishTime = GetTime() - runStart; }
+                if (gPlayerOK) {
+                    if (IsKeyDown(KEY_LEFT))      gMYaw  -= 70.0f * dt;
+                    if (IsKeyDown(KEY_RIGHT))     gMYaw  += 70.0f * dt;
+                    if (IsKeyDown(KEY_UP))        gMVert += 45.0f * dt;
+                    if (IsKeyDown(KEY_DOWN))      gMVert -= 45.0f * dt;
+                    if (IsKeyDown(KEY_PAGE_UP))   gMPush += 45.0f * dt;
+                    if (IsKeyDown(KEY_PAGE_DOWN)) gMPush -= 45.0f * dt;
+                    if (IsKeyPressed(KEY_RIGHT_BRACKET)) gDbgAnim++;
+                    if (IsKeyPressed(KEY_LEFT_BRACKET))  gDbgAnim--;
+                    if (gDbgAnim < -1) gDbgAnim = -1;
+                    if (gDbgAnim >= gPlayerAnimCount) gDbgAnim = gPlayerAnimCount - 1;
                 }
+
+                pDuck = (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_C));
+                float dtarget = pDuck ? 1.0f : 0.0f;
+                float dk = dt * 9.0f; if (dk > 1.0f) dk = 1.0f;
+                gDuckLerp += (dtarget - gDuckLerp) * dk;
+                if (gDuckLerp < 0.001f) gDuckLerp = 0.0f;
+                if (gDuckLerp > 0.999f) gDuckLerp = 1.0f;
+
+                /* fixed 100 Hz simulation -> deterministic, framerate-independent */
+                gPhysAccum += dt * gTimescale;
+                int guard = 0;
+                while (gPhysAccum >= PHYS_DT && guard < 12) {
+                    PhysicsStep(PHYS_DT, fwd, right, look);
+                    gPhysAccum -= PHYS_DT;
+                    guard++;
+                }
+                if (guard >= 12) gPhysAccum = 0.0f;
+
+                float hspeed = sqrtf(pVel.x * pVel.x + pVel.z * pVel.z);
+                if (gWalkOK) {
+                    int walking = (pGround && hspeed > 70.0f && !finished && !gNoclip);
+                    if (walking) {
+                        SetSoundPitch(sndWalk, 0.85f + (hspeed / g_maxspeed) * 0.5f);
+                        if (!IsSoundPlaying(sndWalk)) PlaySound(sndWalk);
+                    } else if (IsSoundPlaying(sndWalk)) {
+                        StopSound(sndWalk);
+                    }
+                }
+
+                if (IsKeyPressed(KEY_R)) ResetRun();
             }
-            if (finished && !wasFinished && gAudio) PlaySound(sndFinish);
-
-            float hspeed = sqrtf(pVel.x * pVel.x + pVel.z * pVel.z);
-            if (!finished && hspeed > topSpeed) topSpeed = hspeed;
-
-            if (gAudio) {
-                float wv = (hspeed - 150.0f) / 450.0f;
-                if (wv < 0.0f) wv = 0.0f;
-                if (wv > 1.0f) wv = 1.0f;
-                SetSoundVolume(sndWind, wv * 0.7f);
-                SetSoundPitch(sndWind, 0.8f + hspeed / 700.0f);
-                if (wv > 0.03f && !IsSoundPlaying(sndWind)) PlaySound(sndWind);
-                if (wv <= 0.03f && IsSoundPlaying(sndWind)) StopSound(sndWind);
-            }
-
-            if (pPos.y < gKillY || IsKeyPressed(KEY_R)) ResetRun();
         }
         else
         {
-            if (gAudio && IsSoundPlaying(sndWind)) StopSound(sndWind);
+            if (gWalkOK && IsSoundPlaying(sndWalk)) StopSound(sndWalk);
             if (state == ST_PAUSE) { if (IsKeyPressed(KEY_ESCAPE)) state = ST_GAME; }
+            else if (state == ST_SPECTATE) {
+                if (IsKeyPressed(KEY_ESCAPE)) { Net_LeaveSpectate(); specHadView = 0; state = ST_MENU; }
+            }
             else menuAngle += dt * 0.06f;
         }
 
@@ -932,9 +1345,23 @@ int main(void)
 
         if (state == ST_GAME || state == ST_PAUSE) {
             Vector3 look = { cosf(pPitch) * cosf(pYaw), sinf(pPitch), cosf(pPitch) * sinf(pYaw) };
-            Vector3 eye = (Vector3){ pPos.x, pPos.y + EYE_OFFSET, pPos.z };
+            float eyeH = EYE_STAND + (EYE_DUCK - EYE_STAND) * gDuckLerp;
+            Vector3 eye = (Vector3){ pPos.x, pPos.y + eyeH, pPos.z };
             cam.position = eye;
             cam.target = Vector3Add(eye, look);
+            if (state == ST_GAME) Net_BroadcastView(eye.x, eye.y, eye.z, pYaw, pPitch);
+        } else if (state == ST_SPECTATE) {
+            float vx, vy, vz, vyaw, vpitch;
+            if (Net_GetView(&vx, &vy, &vz, &vyaw, &vpitch)) {
+                cam.position = (Vector3){ vx, vy, vz };
+                Vector3 look = { cosf(vpitch) * cosf(vyaw), sinf(vpitch), cosf(vpitch) * sinf(vyaw) };
+                cam.target = Vector3Add(cam.position, look);
+                specHadView = 1; specLastPos = cam.position;
+            } else {
+                cam.position = specHadView ? specLastPos
+                             : (Vector3){ gWorldCenter.x, gWorldCenter.y + 250.0f, gWorldCenter.z + 500.0f };
+                cam.target = gWorldCenter;
+            }
         } else {
             float R = gOrbitR;
             Vector3 center = gWorldCenter;
@@ -959,6 +1386,37 @@ int main(void)
             } else {
                 DrawTrack();
             }
+
+            if (gPlayerOK && (state == ST_GAME || state == ST_PAUSE)) {
+                float hspd = sqrtf(pVel.x * pVel.x + pVel.z * pVel.z);
+                int moving = (pGround && hspd > 70.0f);
+                int airborne = !pGround;
+
+                if (gPlayerAnimCount > 0) {
+                    int ai;
+                    float aspeed = 1.0f;
+                    int hold = 0;
+                    if (airborne)            ai = gAnimJumpLoop;
+                    else if (pDuck && moving) ai = gAnimCrouch;
+                    else if (pDuck)           ai = gAnimCrouchIdle;
+                    else if (moving)          { ai = gAnimWalk; aspeed = hspd / 150.0f; if (aspeed < 0.4f) aspeed = 0.4f; if (aspeed > 2.5f) aspeed = 2.5f; }
+                    else                      { ai = gAnimIdle; if (gAnimIdle == 0 && gAnimWalk == 0) hold = 1; }
+                    if (gDbgAnim >= 0) { ai = gDbgAnim; aspeed = 1.0f; hold = 0; }
+                    if (ai < 0 || ai >= gPlayerAnimCount) ai = 0;
+                    gActiveAnim = ai;
+                    gAnimTime += dt * 30.0f * aspeed;
+                    int frames = gPlayerAnims[ai].keyframeCount;
+                    int frame = (frames > 0) ? ((int)gAnimTime) % frames : 0;
+                    if (hold) frame = 0;
+                    UpdateModelAnimation(gPlayerModel, gPlayerAnims[ai], frame);
+                }
+
+                Vector3 fwdv = { cosf(pYaw), 0.0f, sinf(pYaw) };
+                Vector3 mp = { pPos.x + fwdv.x * gMPush, pPos.y + gMVert, pPos.z + fwdv.z * gMPush };
+                float yawDeg = -pYaw * RAD2DEG + gMYaw;
+                DrawModelEx(gPlayerModel, mp, (Vector3){ 0, 1, 0 }, yawDeg,
+                            (Vector3){ gPlayerScale, gPlayerScale, gPlayerScale }, WHITE);
+            }
         EndMode3D();
 
         if (state == ST_GAME)
@@ -968,19 +1426,35 @@ int main(void)
             DrawText(spd, SW / 2 - MeasureText(spd, 64) / 2, SH - 120, 64, RAYWHITE);
             DrawText("u/s", SW / 2 - MeasureText("u/s", 20) / 2, SH - 50, 20, (Color){ 190, 195, 215, 255 });
 
-            double t = finished ? finishTime : (GetTime() - runStart);
+            double t = finished ? finishTime : gRunTime;
             DrawText(TextFormat("Time  %6.2f s", t), 20, 20, 24, RAYWHITE);
             DrawText(TextFormat("Top   %4d u/s", (int)topSpeed), 20, 50, 24, (Color){ 180, 200, 255, 255 });
             if (gUseBsp && selectedMap < (int)gMaps.count)
                 DrawText(TextFormat("Map: %s", GetFileNameWithoutExt(gMaps.paths[selectedMap])), 20, 80, 20, (Color){ 200, 210, 230, 255 });
+            if (gPlayerOK)
+                DrawText(TextFormat("anims: %d  playing: %d  (dbg [ ]: %d)   yaw %.0f push %.0f vert %.0f",
+                         gPlayerAnimCount, gActiveAnim, gDbgAnim, gMYaw, gMPush, gMVert),
+                         20, SH - 56, 18, gPlayerAnimCount > 0 ? (Color){ 150, 220, 150, 255 } : (Color){ 235, 150, 120, 255 });
             if (cpCount > 0) {
                 DrawText(TextFormat("Checkpoint  %d / %d", cpPassed, cpCount), 20, 106, 22, (Color){ 200, 210, 230, 255 });
                 if (cpPassed > 0)
                     DrawText(TextFormat("Last split  %5.2f s", cpSplit[cpPassed - 1]), 20, 132, 20, (Color){ 170, 220, 180, 255 });
             }
 
+            if (Net_SpectatorCount() > 0)
+                TextSp(TextFormat("%d WATCHING", Net_SpectatorCount()),
+                       SW - TextSpW(TextFormat("%d WATCHING", Net_SpectatorCount()), 16, 2) - 20, 20, 16, 2, UI_ACCENT);
+
             DrawLine(SW / 2 - 10, SH / 2, SW / 2 + 10, SH / 2, RAYWHITE);
             DrawLine(SW / 2, SH / 2 - 10, SW / 2, SH / 2 + 10, RAYWHITE);
+
+            if (gNoclip || gTimescale != 1.0f) {
+                char tag[64];
+                snprintf(tag, sizeof tag, "%s%s%s", gNoclip ? "FLY" : "",
+                         (gNoclip && gTimescale != 1.0f) ? "  " : "",
+                         gTimescale != 1.0f ? TextFormat("x%.2f", gTimescale) : "");
+                TextSp(tag, 20, 162, 18, 2, UI_ACCENT);
+            }
 
             if (finished) {
                 const char *msg = TextFormat("FINISH!  %.2f s", finishTime);
@@ -992,36 +1466,46 @@ int main(void)
         }
         else if (state == ST_MENU)
         {
-            DrawRectangle(0, 0, SW, SH, (Color){ 0, 0, 0, 70 });
-            DrawText("CS  SURF", SW / 2 - MeasureText("CS  SURF", 90) / 2, SH / 5, 90, RAYWHITE);
-            DrawText("a raylib surf game", SW / 2 - MeasureText("a raylib surf game", 24) / 2, SH / 5 + 100, 24, (Color){ 175, 190, 225, 255 });
+            DrawRectangle(0, 0, SW, SH, (Color){ 12, 14, 18, 120 });
+            int cx = SW / 2;
 
-            float bw = 320, bh = 58, bx = SW / 2 - bw / 2, by = SH / 2 - 40;
+            const char *title = "CS SURF";
+            int ts = 80, tw = TextSpW(title, ts, 12), tx = cx - tw / 2, ty = SH / 5;
+            TextSp(title, tx, ty, ts, 12, UI_TEXT);
+            DrawRectangle(tx, ty + ts + 8, tw, 4, UI_ACCENT);
+            const char *sub = "A RAYLIB SURF GAME";
+            TextSp(sub, cx - TextSpW(sub, 20, 6) / 2, ty + ts + 22, 20, 6, UI_DIM);
+
+            float bw = 320, bh = 56, bx = cx - bw / 2, by = SH / 2 - 10;
             if (UiButton((Rectangle){ bx, by,       bw, bh }, "Play",        30, 1)) state = ST_MAPSELECT;
-            if (UiButton((Rectangle){ bx, by + 72,  bw, bh }, "Online Maps", 28, 1)) { state = ST_ONLINE; if (!gOnlineFetched) FetchOnlineIndex(); }
-            if (UiButton((Rectangle){ bx, by + 144, bw, bh }, "Options",     30, 1)) state = ST_OPTIONS;
-            if (UiButton((Rectangle){ bx, by + 216, bw, bh }, "Quit",        30, 1)) break;
+            if (UiButton((Rectangle){ bx, by + 70,  bw, bh }, "Online Maps", 30, 1)) { state = ST_ONLINE; if (!gOnlineFetched) FetchOnlineIndex(); }
+            if (UiButton((Rectangle){ bx, by + 140, bw, bh }, "Options",     30, 1)) state = ST_OPTIONS;
+            if (UiButton((Rectangle){ bx, by + 210, bw, bh }, "Quit",        30, 1)) break;
 
-            DrawText("made by eren", 24, SH - 78, 22, (Color){ 210, 215, 230, 255 });
-            Rectangle gh = { 24, SH - 50, 230, 38 };
+            const char *hk = "TYPE COMMANDS IN THE TERMINAL WINDOW  -  'HELP'";
+            TextSp(hk, cx - TextSpW(hk, 16, 3) / 2, SH - 44, 16, 3, UI_LINE);
+
+            Rectangle gh = { 24, SH - 56, 250, 40 };
             Vector2 mpp = GetMousePosition();
             int ghHover = CheckCollisionPointRec(mpp, gh);
-            DrawRectangleRounded(gh, 0.3f, 8, ghHover ? (Color){ 60, 66, 80, 255 } : (Color){ 40, 44, 54, 255 });
-            DrawRectangleLinesEx(gh, ghHover ? 2.0f : 1.0f, (Color){ 150, 160, 180, 160 });
+            DrawRectangleRec(gh, ghHover ? UI_PANEL2 : UI_PANEL);
+            DrawRectangle((int)gh.x, (int)gh.y, 3, (int)gh.height, UI_ACCENT);
+            DrawRectangleLinesEx(gh, 1.0f, (Color){ UI_LINE.r, UI_LINE.g, UI_LINE.b, 200 });
             if (gPfpReady)
                 DrawTexturePro(gPfp, (Rectangle){ 0, 0, (float)gPfp.width, (float)gPfp.height },
-                               (Rectangle){ 34, (float)(SH - 46), 30, 30 }, (Vector2){ 0, 0 }, 0.0f, WHITE);
+                               (Rectangle){ 36, (float)(SH - 50), 28, 28 }, (Vector2){ 0, 0 }, 0.0f, WHITE);
             else
-                DrawGithubMark(34, SH - 46, 30, RAYWHITE);
-            DrawText("github.com/Erennkrb", 74, SH - 41, 18, RAYWHITE);
-            if (ghHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { PlayClick(); OpenURL("https://github.com/Erennkrb"); }
+                DrawGithubMark(36, SH - 50, 28, UI_TEXT);
+            TextSp("github.com/" GITHUB_USER, 74, SH - 44, 16, 1, UI_TEXT);
+            if (ghHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { PlayClick(); OpenURL("https://github.com/" GITHUB_USER); }
         }
         else if (state == ST_MAPSELECT)
         {
-            DrawRectangle(0, 0, SW, SH, (Color){ 0, 0, 0, 130 });
-            DrawText("Select Map", SW / 2 - MeasureText("Select Map", 56) / 2, 50, 56, RAYWHITE);
-            DrawText(TextFormat("%d maps found  -  drop .bsp files into the game folder", (int)gMaps.count),
-                     SW / 2 - MeasureText("..", 18) / 2 - 200, 116, 18, (Color){ 175, 185, 210, 255 });
+            DrawRectangle(0, 0, SW, SH, (Color){ 12, 14, 18, 150 });
+            DrawHeader("Select Map", 50, SW);
+            const char *hint2 = "DROP .BSP FILES INTO THE GAME FOLDER";
+            TextSp(TextFormat("%d MAPS FOUND   -   %s", (int)gMaps.count, hint2),
+                   SW / 2 - TextSpW(TextFormat("%d MAPS FOUND   -   %s", (int)gMaps.count, hint2), 16, 2) / 2, 120, 16, 2, UI_DIM);
 
             int total = (int)gMaps.count;
             const int VIS = 7;
@@ -1033,7 +1517,7 @@ int main(void)
             float cw = 620, ch = 56, cx = SW / 2 - cw / 2, cy = 160, gap = 64;
 
             if (total == 0) {
-                DrawText("No .bsp maps found", SW / 2 - MeasureText("No .bsp maps found", 28) / 2, 260, 28, (Color){ 230, 180, 120, 255 });
+                TextSp("NO .BSP MAPS FOUND", SW / 2 - TextSpW("NO .BSP MAPS FOUND", 26, 3) / 2, 260, 26, 3, UI_ACCENT);
             }
             for (int k = 0; k < VIS && (k + gScroll) < total; k++) {
                 int i = k + gScroll;
@@ -1041,16 +1525,17 @@ int main(void)
                 Vector2 mm = GetMousePosition();
                 int hover = CheckCollisionPointRec(mm, rc);
                 int isSel = (gUseBsp && selectedMap == i);
-                DrawRectangleRounded(rc, 0.15f, 8, hover ? (Color){ 70, 95, 150, 255 } : (Color){ 45, 55, 80, 255 });
-                DrawRectangleLinesEx(rc, (hover || isSel) ? 2.0f : 1.0f, isSel ? (Color){ 120, 220, 150, 220 } : (Color){ 150, 175, 220, 180 });
-                DrawText(GetFileNameWithoutExt(gMaps.paths[i]), (int)cx + 22, (int)(cy + gap * k) + 16, 26, RAYWHITE);
+                DrawRectangleRec(rc, hover ? UI_PANEL2 : UI_PANEL);
+                DrawRectangle((int)rc.x, (int)rc.y, (hover || isSel) ? 5 : 3, (int)rc.height, isSel ? (Color){ 120, 220, 150, 255 } : UI_ACCENT);
+                DrawRectangleLinesEx(rc, 1.0f, (Color){ UI_LINE.r, UI_LINE.g, UI_LINE.b, 200 });
+                TextSp(GetFileNameWithoutExt(gMaps.paths[i]), (int)cx + 24, (int)(cy + gap * k) + 18, 24, 1, UI_TEXT);
                 if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     PlayClick();
                     if (LoadBspMap(i)) { ResetRun(); state = ST_GAME; }
                 }
             }
             if (total > VIS)
-                DrawText("scroll for more", (int)cx, (int)(cy + gap * VIS) + 2, 16, (Color){ 160, 165, 185, 255 });
+                TextSp("SCROLL FOR MORE", (int)cx, (int)(cy + gap * VIS) + 2, 14, 2, UI_DIM);
 
             float by = cy + gap * VIS + 26;
             if (UiButton((Rectangle){ cx, by, 300, 50 }, "Refresh", 26, 1)) { ScanMaps(); }
@@ -1058,10 +1543,11 @@ int main(void)
         }
         else if (state == ST_ONLINE)
         {
-            DrawRectangle(0, 0, SW, SH, (Color){ 0, 0, 0, 140 });
-            DrawText("Online Maps", SW / 2 - MeasureText("Online Maps", 50) / 2, 40, 50, RAYWHITE);
-            DrawText("surfmaparchive.com  (CS 1.6)", SW / 2 - MeasureText("surfmaparchive.com  (CS 1.6)", 18) / 2, 96, 18, (Color){ 175, 185, 210, 255 });
-            if (gStatus[0]) DrawText(gStatus, SW / 2 - MeasureText(gStatus, 18) / 2, 120, 18, (Color){ 170, 220, 180, 255 });
+            DrawRectangle(0, 0, SW, SH, (Color){ 12, 14, 18, 160 });
+            DrawHeader("Online Maps", 36, SW);
+            const char *src = "SURFMAPARCHIVE.COM   (CS 1.6)";
+            TextSp(src, SW / 2 - TextSpW(src, 16, 2) / 2, 100, 16, 2, UI_DIM);
+            if (gStatus[0]) DrawText(gStatus, SW / 2 - MeasureText(gStatus, 18) / 2, 124, 18, UI_ACCENT);
 
             int total = gOnlineCount;
             const int VIS = 8;
@@ -1076,17 +1562,23 @@ int main(void)
                 Rectangle rc = { cx, cy + gap * k, cw, ch };
                 Vector2 mm = GetMousePosition();
                 int hover = CheckCollisionPointRec(mm, rc);
-                DrawRectangleRounded(rc, 0.18f, 6, hover ? (Color){ 70, 95, 150, 255 } : (Color){ 45, 55, 80, 255 });
-                DrawRectangleLinesEx(rc, hover ? 2.0f : 1.0f, (Color){ 150, 175, 220, 180 });
-                DrawText(gOnline[i], (int)cx + 20, (int)(cy + gap * k) + 13, 24, RAYWHITE);
-                DrawText("download", (int)(cx + cw - 110), (int)(cy + gap * k) + 16, 18, (Color){ 170, 200, 240, 255 });
+                int local = FindLocalMap(gOnline[i]);
+                DrawRectangleRec(rc, hover ? UI_PANEL2 : UI_PANEL);
+                DrawRectangle((int)rc.x, (int)rc.y, hover ? 5 : 3, (int)rc.height, local >= 0 ? (Color){ 120, 220, 150, 255 } : UI_ACCENT);
+                DrawRectangleLinesEx(rc, 1.0f, (Color){ UI_LINE.r, UI_LINE.g, UI_LINE.b, 200 });
+                TextSp(gOnline[i], (int)cx + 22, (int)(cy + gap * k) + 15, 22, 1, UI_TEXT);
+                if (local >= 0)
+                    TextSp("DOWNLOADED", (int)(cx + cw - 140), (int)(cy + gap * k) + 17, 16, 1, (Color){ 120, 220, 150, 255 });
+                else
+                    TextSp("DOWNLOAD", (int)(cx + cw - 115), (int)(cy + gap * k) + 17, 16, 1, UI_DIM);
                 if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     PlayClick();
-                    if (DownloadAndPlay(gOnline[i])) { ResetRun(); state = ST_GAME; }
+                    int ok = (local >= 0) ? LoadBspMap(local) : DownloadAndPlay(gOnline[i]);
+                    if (ok) { ResetRun(); state = ST_GAME; }
                 }
             }
             if (total > VIS)
-                DrawText("scroll for more", (int)cx, (int)(cy + gap * VIS) + 2, 16, (Color){ 160, 165, 185, 255 });
+                TextSp("SCROLL FOR MORE", (int)cx, (int)(cy + gap * VIS) + 2, 14, 2, UI_DIM);
 
             float by2 = cy + gap * VIS + 24;
             if (UiButton((Rectangle){ cx, by2, 300, 50 }, "Reload List", 24, 1)) { gOnlineFetched = 0; FetchOnlineIndex(); gOnlineScroll = 0; }
@@ -1094,8 +1586,8 @@ int main(void)
         }
         else if (state == ST_OPTIONS)
         {
-            DrawRectangle(0, 0, SW, SH, (Color){ 0, 0, 0, 130 });
-            DrawText("Graphics Options", SW / 2 - MeasureText("Graphics Options", 50) / 2, 60, 50, RAYWHITE);
+            DrawRectangle(0, 0, SW, SH, (Color){ 12, 14, 18, 150 });
+            DrawHeader("Graphics Options", 56, SW);
 
             float rowW = 560, rowH = 54, rx = SW / 2 - rowW / 2, ry = 170, gap = 68;
             char buf[128];
@@ -1122,18 +1614,18 @@ int main(void)
         }
         else if (state == ST_PAUSE)
         {
-            DrawRectangle(0, 0, SW, SH, (Color){ 0, 0, 0, 150 });
-            DrawText("Paused", SW / 2 - MeasureText("Paused", 50) / 2, 50, 50, RAYWHITE);
+            DrawRectangle(0, 0, SW, SH, (Color){ 12, 14, 18, 175 });
+            DrawHeader("Paused", 50, SW);
 
             float rowW = 560, rowH = 54, rx = SW / 2 - rowW / 2, ry = 140, gap = 66;
             char buf[128];
 
             snprintf(buf, sizeof buf, "Mouse Sensitivity:  %.2f", settings.mouseSens * 0.1f);
-            DrawText(buf, (int)rx, (int)ry + 14, 24, RAYWHITE);
+            TextSp(buf, (int)rx, (int)ry + 16, 22, 1, UI_TEXT);
             if (UiButton((Rectangle){ rx + rowW - 130, ry, 60, rowH }, "-", 30, 1)) { settings.mouseSens -= 2; if (settings.mouseSens < 3) settings.mouseSens = 3; }
             if (UiButton((Rectangle){ rx + rowW - 60,  ry, 60, rowH }, "+", 30, 1)) { settings.mouseSens += 2; if (settings.mouseSens > 200) settings.mouseSens = 200; }
             snprintf(buf, sizeof buf, "Field of View:  %d", settings.fov);
-            DrawText(buf, (int)rx, (int)(ry + gap) + 14, 24, RAYWHITE);
+            TextSp(buf, (int)rx, (int)(ry + gap) + 16, 22, 1, UI_TEXT);
             if (UiButton((Rectangle){ rx + rowW - 130, ry + gap, 60, rowH }, "-", 30, 1)) { settings.fov -= 5; if (settings.fov < 60) settings.fov = 60; }
             if (UiButton((Rectangle){ rx + rowW - 60,  ry + gap, 60, rowH }, "+", 30, 1)) { settings.fov += 5; if (settings.fov > 120) settings.fov = 120; }
 
@@ -1142,17 +1634,37 @@ int main(void)
             if (UiButton((Rectangle){ rx, ry + gap * 4 + 6, rowW, rowH }, "Main Menu",    28, 1)) { Settings_Save(&settings); state = ST_MENU; }
 
             int cty = (int)(ry + gap * 5 + 24);
-            DrawText("Controls", (int)rx, cty, 24, (Color){ 200, 210, 235, 255 });
+            TextSp("CONTROLS", (int)rx, cty, 20, 3, UI_ACCENT);
             DrawText("Mouse - look      A / D - strafe (surf)      W / S - forward / back",
-                     (int)rx, cty + 34, 18, (Color){ 200, 205, 220, 255 });
-            DrawText("SPACE - jump      R - restart      ESC - pause      F11 - fullscreen",
-                     (int)rx, cty + 58, 18, (Color){ 200, 205, 220, 255 });
+                     (int)rx, cty + 32, 18, UI_DIM);
+            DrawText("SPACE - jump      CTRL - duck      R - restart      ESC - pause      (commands: terminal window)",
+                     (int)rx, cty + 56, 18, UI_DIM);
+        }
+        else if (state == ST_SPECTATE)
+        {
+            int live = specHadView;
+            DrawRectangle(0, 0, SW, 64, (Color){ 12, 14, 18, 170 });
+            DrawRectangle(0, 64, SW, 2, UI_ACCENT);
+            char head[96];
+            snprintf(head, sizeof head, "SPECTATING  %s", Net_HostName());
+            TextSp(head, 24, 22, 22, 3, UI_TEXT);
+            const char *leave = "ESC - LEAVE";
+            TextSp(leave, SW - TextSpW(leave, 18, 3) - 24, 24, 18, 3, UI_ACCENT);
+            if (!live || !Net_GetView(NULL, NULL, NULL, NULL, NULL)) {
+                const char *w = "WAITING FOR HOST ...";
+                TextSp(w, SW / 2 - TextSpW(w, 24, 4) / 2, SH / 2 - 16, 24, 4, UI_DIM);
+            }
         }
 
         if (settings.showFps) DrawFPS(SW - 90, 20);
         EndDrawing();
     }
 
+    if (gPlayerOK) {
+        if (gPlayerAnims) UnloadModelAnimations(gPlayerAnims, gPlayerAnimCount);
+        if (gPlayerTexOK) UnloadTexture(gPlayerTex);
+        UnloadModel(gPlayerModel);
+    }
     FreeWorld();
     if (gMapsLoaded) UnloadDirectoryFiles(gMaps);
     if (gLightOK) UnloadShader(gLight);
@@ -1160,11 +1672,13 @@ int main(void)
     if (gPfpReady) UnloadTexture(gPfp);
     if (gAudio) {
         UnloadSound(sndClick);
+        UnloadSound(sndHover);
         UnloadSound(sndJump);
         UnloadSound(sndFinish);
-        UnloadSound(sndWind);
+        if (gWalkOK) UnloadSound(sndWalk);
         CloseAudioDevice();
     }
+    Net_Shutdown();
     Settings_Save(&settings);
     CloseWindow();
     return 0;
