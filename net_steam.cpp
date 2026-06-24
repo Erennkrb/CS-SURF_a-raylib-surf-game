@@ -25,7 +25,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
 #include <vector>
+
+// Step logging to the game's terminal so a crash points at the last line.
+static void NLog(const char *fmt, ...) {
+    va_list a; va_start(a, fmt);
+    printf("[net] "); vprintf(fmt, a); printf("\n"); fflush(stdout);
+    va_end(a);
+}
 
 #define NET_CHANNEL 0
 
@@ -53,7 +61,9 @@ public:
     char     m_specMap[64]  = "";
     bool     m_haveView     = false;
     bool     m_viewDirty    = false;
+    bool     m_loggedView   = false;
     double   m_lastView     = 0.0;
+    double   m_lastHello    = -1.0;
     Pkt      m_view         = {};
 
     Net() {}
@@ -115,8 +125,9 @@ public:
 };
 
 void Net::OnLobbyCreated(LobbyCreated_t *p) {
-    if (p->m_eResult != k_EResultOK) return;
+    if (p->m_eResult != k_EResultOK) { NLog("host lobby create failed (%d)", (int)p->m_eResult); return; }
     m_hostLobby = p->m_ulSteamIDLobby;
+    NLog("host lobby created %llu", (unsigned long long)m_hostLobby);
     Advertise();
     if (SteamFriends()) {
         SteamFriends()->SetRichPresence("status", "Surfing");
@@ -127,31 +138,32 @@ void Net::OnLobbyCreated(LobbyCreated_t *p) {
 }
 
 void Net::OnJoinRequested(GameLobbyJoinRequested_t *p) {
+    NLog("invite accepted -> joining lobby %llu", (unsigned long long)p->m_steamIDLobby.ConvertToUint64());
     if (SteamMatchmaking())
         SteamMatchmaking()->JoinLobby(p->m_steamIDLobby);
 }
 
 void Net::OnLobbyEnter(LobbyEnter_t *p) {
     uint64_t lobby = p->m_ulSteamIDLobby;
-    if (lobby == m_hostLobby) return;            // our own host lobby - ignore
+    if (lobby == m_hostLobby) { NLog("entered own host lobby (ignore)"); return; }
     m_joinLobby = lobby;
     m_specHost  = SteamMatchmaking() ? SteamMatchmaking()->GetLobbyOwner(CSteamID(lobby)).ConvertToUint64() : 0;
     const char *map = SteamMatchmaking() ? SteamMatchmaking()->GetLobbyData(CSteamID(lobby), "map") : "";
     strncpy(m_specMap, map ? map : "", sizeof m_specMap - 1);
     m_specMap[sizeof m_specMap - 1] = 0;
     m_specPending = true;
-    if (m_specHost) {                            // open the P2P session to the host
-        Pkt h; memset(&h, 0, sizeof h); h.type = PKT_HELLO;
-        Send(m_specHost, h, 1, k_nSteamNetworkingSend_Reliable);
-    }
+    m_lastHello   = -1.0;   // HELLO is sent from Net_Update (off the callback stack)
+    NLog("entered lobby %llu host=%llu map='%s'", (unsigned long long)lobby, (unsigned long long)m_specHost, m_specMap);
 }
 
 void Net::OnSessionReq(SteamNetworkingMessagesSessionRequest_t *p) {
+    NLog("session request from %llu -> accept", (unsigned long long)p->m_identityRemote.GetSteamID64());
     if (SteamNetworkingMessages_SteamAPI())
         SteamNetworkingMessages_SteamAPI()->AcceptSessionWithUser(p->m_identityRemote);
 }
 
 void Net::OnSessionFail(SteamNetworkingMessagesSessionFailed_t *p) {
+    NLog("session failed with %llu", (unsigned long long)p->m_info.m_identityRemote.GetSteamID64());
     DropSpec(p->m_info.m_identityRemote.GetSteamID64());
 }
 
@@ -170,6 +182,7 @@ int Net_Init(void) {
     g->m_ok = true;
     if (SteamNetworkingUtils()) SteamNetworkingUtils()->InitRelayNetworkAccess();
     g->CreateHostLobby();
+    NLog("init ok");
     return 1;
 }
 
@@ -187,7 +200,18 @@ void Net_Update(void) {
     gNow += 1.0 / 60.0;           // coarse clock; only used for view-freshness
     SteamAPI_RunCallbacks();
     g->Pump();
-    if (g->m_viewDirty) { g->m_lastView = gNow; g->m_viewDirty = false; }
+    // Open/keep the session to the host from the main loop (never inside a
+    // Steam callback). Resend HELLO until the host's view starts flowing.
+    if (g->m_specHost && !g->m_haveView && (gNow - g->m_lastHello) > 0.4) {
+        Pkt h; memset(&h, 0, sizeof h); h.type = PKT_HELLO;
+        g->Send(g->m_specHost, h, 1, k_nSteamNetworkingSend_Reliable);
+        g->m_lastHello = gNow;
+        NLog("HELLO -> host %llu", (unsigned long long)g->m_specHost);
+    }
+    if (g->m_viewDirty) {
+        g->m_lastView = gNow; g->m_viewDirty = false;
+        if (!g->m_loggedView) { g->m_loggedView = true; NLog("receiving host view"); }
+    }
 }
 
 int  Net_Available(void)       { return (g && g->m_ok) ? 1 : 0; }
@@ -244,6 +268,8 @@ void Net_LeaveSpectate(void) {
         SteamMatchmaking()->LeaveLobby(CSteamID(g->m_joinLobby));
     g->m_specHost = 0; g->m_joinLobby = 0; g->m_haveView = false;
     g->m_specPending = false; g->m_specMap[0] = 0;
+    g->m_loggedView = false; g->m_lastHello = -1.0;
+    NLog("left spectate");
 }
 
 } // extern "C"

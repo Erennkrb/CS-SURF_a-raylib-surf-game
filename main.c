@@ -1260,8 +1260,14 @@ int main(void)
         {
             char joinMap[64];
             if (Net_PollSpectateStart(joinMap, sizeof joinMap)) {
-                if (joinMap[0]) { int mi = FindLocalMap(joinMap); if (mi >= 0) LoadBspMap(mi); }
-                ConPrint("Spectating %s", Net_HostName());
+                ConPrint("[spectate] join accepted, host map = '%s'", joinMap);
+                if (joinMap[0]) {
+                    int mi = FindLocalMap(joinMap);
+                    ConPrint("[spectate] local map index = %d", mi);
+                    if (mi >= 0) { LoadBspMap(mi); ConPrint("[spectate] map loaded"); }
+                    else ConPrint("[spectate] map not found locally - rendering host view over current world");
+                }
+                ConPrint("[spectate] watching %s", Net_HostName());
                 state = ST_SPECTATE;
             }
         }
