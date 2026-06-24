@@ -57,6 +57,7 @@ public:
     // spectator side
     uint64_t m_specHost     = 0;
     uint64_t m_joinLobby    = 0;
+    bool     m_resolvePending = false;   // joined a lobby, resolve owner/map off-callback
     bool     m_specPending  = false;
     char     m_specMap[64]  = "";
     bool     m_haveView     = false;
@@ -144,16 +145,13 @@ void Net::OnJoinRequested(GameLobbyJoinRequested_t *p) {
 }
 
 void Net::OnLobbyEnter(LobbyEnter_t *p) {
+    // Keep this callback minimal: record the lobby and resolve owner/map later
+    // from Net_Update (never query Steam from inside its own dispatch).
     uint64_t lobby = p->m_ulSteamIDLobby;
+    NLog("LobbyEnter fired (lobby %llu, resp %u)", (unsigned long long)lobby, (unsigned)p->m_EChatRoomEnterResponse);
     if (lobby == m_hostLobby) { NLog("entered own host lobby (ignore)"); return; }
     m_joinLobby = lobby;
-    m_specHost  = SteamMatchmaking() ? SteamMatchmaking()->GetLobbyOwner(CSteamID(lobby)).ConvertToUint64() : 0;
-    const char *map = SteamMatchmaking() ? SteamMatchmaking()->GetLobbyData(CSteamID(lobby), "map") : "";
-    strncpy(m_specMap, map ? map : "", sizeof m_specMap - 1);
-    m_specMap[sizeof m_specMap - 1] = 0;
-    m_specPending = true;
-    m_lastHello   = -1.0;   // HELLO is sent from Net_Update (off the callback stack)
-    NLog("entered lobby %llu host=%llu map='%s'", (unsigned long long)lobby, (unsigned long long)m_specHost, m_specMap);
+    m_resolvePending = true;
 }
 
 void Net::OnSessionReq(SteamNetworkingMessagesSessionRequest_t *p) {
@@ -199,6 +197,21 @@ void Net_Update(void) {
     if (!g || !g->m_ok) return;
     gNow += 1.0 / 60.0;           // coarse clock; only used for view-freshness
     SteamAPI_RunCallbacks();
+
+    // Resolve a freshly-joined lobby's host + map outside the callback stack.
+    if (g->m_resolvePending && g->m_joinLobby) {
+        g->m_resolvePending = false;
+        ISteamMatchmaking *mm = SteamMatchmaking();
+        g->m_specHost = mm ? mm->GetLobbyOwner(CSteamID(g->m_joinLobby)).ConvertToUint64() : 0;
+        const char *map = mm ? mm->GetLobbyData(CSteamID(g->m_joinLobby), "map") : "";
+        strncpy(g->m_specMap, map ? map : "", sizeof g->m_specMap - 1);
+        g->m_specMap[sizeof g->m_specMap - 1] = 0;
+        g->m_specPending = true;
+        g->m_lastHello = -1.0;
+        NLog("resolved lobby %llu host=%llu map='%s'",
+             (unsigned long long)g->m_joinLobby, (unsigned long long)g->m_specHost, g->m_specMap);
+    }
+
     g->Pump();
     // Open/keep the session to the host from the main loop (never inside a
     // Steam callback). Resend HELLO until the host's view starts flowing.
@@ -267,7 +280,7 @@ void Net_LeaveSpectate(void) {
     if (g->m_joinLobby && SteamMatchmaking())
         SteamMatchmaking()->LeaveLobby(CSteamID(g->m_joinLobby));
     g->m_specHost = 0; g->m_joinLobby = 0; g->m_haveView = false;
-    g->m_specPending = false; g->m_specMap[0] = 0;
+    g->m_specPending = false; g->m_resolvePending = false; g->m_specMap[0] = 0;
     g->m_loggedView = false; g->m_lastHello = -1.0;
     NLog("left spectate");
 }

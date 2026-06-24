@@ -1090,6 +1090,7 @@ static void ExecCommand(const char *line)
 
 int main(void)
 {
+    Con_InstallCrashHandler();
     Settings settings;
     Settings_Load(&settings);
     settings.fullscreen = 0;

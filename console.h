@@ -7,4 +7,8 @@
 void Con_Start(void);
 int  Con_Poll(char *out, int cap);   /* 1 if a line was dequeued, else 0 */
 
+/* Installs a last-chance handler that prints the faulting module/address to
+   the terminal and crash.txt, so a hard crash tells us where it happened. */
+void Con_InstallCrashHandler(void);
+
 #endif
